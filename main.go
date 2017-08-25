@@ -32,17 +32,21 @@ import (
 	"strings"
 	"time"
 
+	bluemix "github.com/IBM-Bluemix/bluemix-go"
+    bmsession "github.com/IBM-Bluemix/bluemix-go/session"
+    "github.com/IBM-Bluemix/bluemix-go/api/mccp/mccpv2"
 	"github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecr"
 	flag "github.com/spf13/pflag"
-	"github.com/upmc-enterprises/registry-creds/k8sutil"
+	//"github.com/upmc-enterprises/registry-creds/k8sutil"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"k8s.io/client-go/pkg/api/v1"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"k8s.io/registry-creds/k8sutil"
 )
 
 const (
@@ -54,20 +58,28 @@ const (
 )
 
 var (
-	flags             = flag.NewFlagSet("", flag.ContinueOnError)
-	argKubecfgFile    = flags.String("kubecfg-file", "", `Location of kubecfg file for access to kubernetes master service; --kube_master_url overrides the URL part of this; if neither this nor --kube_master_url are provided, defaults to service account tokens`)
-	argKubeMasterURL  = flags.String("kube-master-url", "", `URL to reach kubernetes master. Env variables in this flag will be expanded.`)
-	argAWSSecretName  = flags.String("aws-secret-name", "awsecr-cred", `Default AWS secret name`)
-	argDPRSecretName  = flags.String("dpr-secret-name", "dpr-secret", `Default Docker Private Registry secret name`)
-	argGCRSecretName  = flags.String("gcr-secret-name", "gcr-secret", `Default GCR secret name`)
-	argGCRURL         = flags.String("gcr-url", "https://gcr.io", `Default GCR URL`)
-	argAWSRegion      = flags.String("aws-region", "us-east-1", `Default AWS region`)
-	argDPRPassword    = flags.String("dpr-password", "", "Docker Private Registry password")
-	argDPRServer      = flags.String("dpr-server", "", "Docker Private Registry server")
-	argDPRUser        = flags.String("dpr-user", "", "Docker Private Registry user")
-	argRefreshMinutes = flags.Int("refresh-mins", 60, `Default time to wait before refreshing (60 minutes)`)
-	argSkipKubeSystem = flags.Bool("skip-kube-system", true, `If true, will not attempt to set ImagePullSecrets on the kube-system namespace`)
-	argAWSAssumeRole  = flags.String( "aws_assume_role", "",  `If specified AWS will assume this role and use it to retrieve tokens`)
+	flags                = flag.NewFlagSet("", flag.ContinueOnError)
+	argKubecfgFile       = flags.String("kubecfg-file", "", `Location of kubecfg file for access to kubernetes master service; --kube_master_url overrides the URL part of this; if neither this nor --kube_master_url are provided, defaults to service account tokens`)
+	argKubeMasterURL     = flags.String("kube-master-url", "", `URL to reach kubernetes master. Env variables in this flag will be expanded.`)
+	argAWSSecretName     = flags.String("aws-secret-name", "awsecr-cred", `Default AWS secret name`)
+	argDPRSecretName     = flags.String("dpr-secret-name", "dpr-secret", `Default Docker Private Registry secret name`)
+	argGCRSecretName     = flags.String("gcr-secret-name", "gcr-secret", `Default GCR secret name`)
+	argBMCRSecretName    = flags.String("bmcr-secret-name", "bmcr-secret", `Default BMCR secret name`)
+	argGCRURL            = flags.String("gcr-url", "https://gcr.io", `Default GCR URL`)
+	argAWSRegion         = flags.String("aws-region", "us-east-1", `Default AWS region`)
+	argDPRPassword       = flags.String("dpr-password", "", "Docker Private Registry password")
+	argDPRServer         = flags.String("dpr-server", "", "Docker Private Registry server")
+	argDPRUser           = flags.String("dpr-user", "", "Docker Private Registry user")
+	argRefreshMinutes    = flags.Int("refresh-mins", 60, `Default time to wait before refreshing (60 minutes)`)
+	argSkipKubeSystem    = flags.Bool("skip-kube-system", true, `If true, will not attempt to set ImagePullSecrets on the kube-system namespace`)
+	argAWSAssumeRole     = flags.String("aws_assume_role", "", `If specified AWS will assume this role and use it to retrieve tokens`)
+	argBMCRURL           = flags.String("bmcr-url", "https://api.ng.bluemix.net", `Default BMCR URL`)
+	argBMCREmail         = flags.String("bmcr-email", "", `Bluemix Account Email`)
+	argBMCRSSO           = flags.Bool("bmcr-sso", false, `If true will attempt to use SSO to sign in`)
+	argBMCRIBMID         = flags.String("ibmid", "", "Bluemix(IBMID) to Login with")
+	argBMCRIBMIDPassword = flags.String("ibmid-password", "", "Bluemix(Password) to Login with")
+	argBMCRRegion        = flags.String("bmcr-region", "us-south", "Select Bluemix Region")
+	argBMCRAPIKey        = flags.String("bmcr-apikey", "", "Select Bluemix API Key")
 )
 
 var (
@@ -75,10 +87,11 @@ var (
 )
 
 type controller struct {
-	k8sutil   *k8sutil.K8sutilInterface
-	ecrClient ecrInterface
-	gcrClient gcrInterface
-	dprClient dprInterface
+	k8sutil    *k8sutil.K8sutilInterface
+	ecrClient  ecrInterface
+	gcrClient  gcrInterface
+	dprClient  dprInterface
+	bmcrClient bmcrInterface
 }
 
 // Docker Private Registry interface
@@ -92,6 +105,20 @@ type ecrInterface interface {
 
 type gcrInterface interface {
 	DefaultTokenSource(ctx context.Context, scope ...string) (oauth2.TokenSource, error)
+}
+
+type bmcrInterface interface {
+	GetAuthorizationToken(input ) (*)
+}
+
+func newBmcrClient() bmcrInterface {
+	bmconfig := new(bluemix.Config)
+	bmconfig.IBMID = &argBMCRIBMID
+	bmconfig.IBMIDPassword = *argBMCRIBMIDPassword
+	bmconfig.Region = *argBMCRRegion
+	bmconfig.Debug = true
+
+	return mccpv2.New(bmsession.New(bmconfig))
 }
 
 func newEcrClient() ecrInterface {
@@ -168,6 +195,10 @@ func (c *controller) getGCRAuthorizationKey() (AuthToken, error) {
 		Endpoint:    *argGCRURL}, nil
 }
 
+type bmcrClient struct{}
+
+func (bmcr bmcrClient) getAuthToken()
+
 func (c *controller) getECRAuthorizationKey() (AuthToken, error) {
 	params := &ecr.GetAuthorizationTokenInput{
 		RegistryIds: []*string{
@@ -239,6 +270,12 @@ func getSecretGenerators(c *controller) []SecretGenerator {
 		TokenGenFxn: c.getDPRToken,
 		IsJSONCfg:   true,
 		SecretName:  *argDPRSecretName,
+	})
+
+	secretGenerators = append(secretGenerators, SecretGenerator{
+		TokenGenFxn: c.getBMCRToken,
+		IsJSONCfg:   true,
+		SecretName:  *argBMCRSecretName,
 	})
 
 	return secretGenerators
@@ -313,11 +350,15 @@ func validateParams() {
 	// Allow environment variables to overwrite args
 	awsAccountIDEnv := os.Getenv("awsaccount")
 	awsRegionEnv := os.Getenv("awsregion")
-	argAWSAssumeRoleEnv := os.Getenv( "aws_assume_role")
+	argAWSAssumeRoleEnv := os.Getenv("aws_assume_role")
 	dprPassword := os.Getenv(dockerPrivateRegistryPasswordKey)
 	dprServer := os.Getenv(dockerPrivateRegistryServerKey)
 	dprUser := os.Getenv(dockerPrivateRegistryUserKey)
 	gcrURLEnv := os.Getenv("gcrurl")
+	argBMCRIBMID := os.Getenv("IBMID")
+	bmcrIBMIDPassword := os.Getenv("IBMID_PASSWORD")
+	bmcrAPIKey := os.Getenv("BLUEMIX_API_KEY")
+	bmcrRegion := os.Getenv("BLUEMIX_REGION")
 
 	if len(awsRegionEnv) > 0 {
 		argAWSRegion = &awsRegionEnv
@@ -346,6 +387,23 @@ func validateParams() {
 	if len(argAWSAssumeRoleEnv) > 0 {
 		argAWSAssumeRole = &argAWSAssumeRoleEnv
 	}
+
+	if len(argBMCRIBMID) > 0 {
+		argBMCRIBMID = &argBMCRIBMID
+	}
+
+	if len(argBMCRIBMIDPassword) > 0 {
+		argBMCRIBMIDPassword = &argBMCRIBMIDPassword
+	}
+
+	if len(argBMCRAPIKey) > 0 {
+		argBMCRAPIKey = &argBMCRAPIKey
+	}
+
+	if len(bmcrRegion) > 0 {
+		argBMCRRegion = &argBMCRRegion
+	}
+
 }
 
 func handler(c *controller, ns *v1.Namespace) error {
@@ -385,7 +443,8 @@ func main() {
 	ecrClient := newEcrClient()
 	gcrClient := newGcrClient()
 	dprClient := newDprClient()
-	c := &controller{util, ecrClient, gcrClient, dprClient}
+	bmcrClient := newBmcrClient()
+	c := &controller{util, ecrClient, gcrClient, dprClient, bmcrClient}
 
 	util.WatchNamespaces(time.Duration(*argRefreshMinutes)*time.Minute, func(ns *v1.Namespace) error {
 		return handler(c, ns)
